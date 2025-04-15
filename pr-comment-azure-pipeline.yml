@@ -1,0 +1,185 @@
+# Node.js
+
+# Build a general Node.js project with npm.
+# Add steps that analyze code, save build artifacts, deploy, and more:
+# https://docs.microsoft.com/azure/devops/pipelines/languages/javascript
+
+#trigger:
+#- master
+
+trigger:
+  branches:
+    include:
+      - main
+pr:
+  branches:
+    include:
+      - main 
+
+jobs:
+  - job: SnykScan
+    displayName: 'Run Snyk Security Test on PR'
+    pool:
+      name: Azure Pipelines      
+
+
+    steps:
+    # Step 1: Checkout the PR branch
+    - checkout: self
+      displayName: 'Checkout code'
+
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '20.x'
+      displayName: 'Install Node.js'
+
+    - script: | 
+        npm install snyk -g
+        npm install snyk-to-html -g
+        snyk auth $(SNYK_TOKEN)
+      displayName: 'snyk install'
+
+    - script: |
+        snyk test --all-projects --sarif-file-output=snyk-oss.sarif
+      displayName: 'Run Snyk Test on PR'
+      continueOnError: true  # Ensure pipeline continues even if vulnerabilities are found
+
+    - script: |
+        echo "🔍 Inspecting SARIF contents for debugging severity field..."
+        jq -r '
+          .runs[].results[] |
+          select(.message.text | test("(?<sev>low|medium|high) severity"; "i") | not)
+          | {ruleId, message: .message.text}
+        ' snyk-oss.sarif
+
+
+    
+    # Step 5: Parse the SARIF file to get vulnerabilities and report on PR
+    - script: |
+        echo "Posting Snyk vulnerabilities to PR"
+
+        # Hardcoded values
+        ORGANIZATION="mariahito"  # Replace with your actual organization name
+        PROJECT="demos"  # Replace with your actual project name
+        REPO_NAME="juice-shop.git"  # Replace with your actual repo name
+        PR_ID="33"  # Replace with your actual PR ID
+
+        # Construct the COMMENT_URL with hardcoded values
+        COMMENT_URL="https://dev.azure.com/$ORGANIZATION/$PROJECT/_apis/git/repositories/$REPO_NAME/pullRequests/$PR_ID/threads?api-version=7.1"
+
+        # Read the SARIF file and extract vulnerability info
+        # Counting the total vulnerabilities accurately by using jq and fixing over-counting
+        vulnerability_count=$(jq '[.runs[].results[]] | length' snyk-oss.sarif)
+
+        # Build a formatted comment with severity distinctions
+        comment_body="### ⚠️ **Snyk Security Scan Results**\n"
+        comment_body+="Total vulnerabilities found: **$vulnerability_count**\n\n"
+
+        # Extract and format vulnerabilities by severity (Including Critical)
+        critical_severity_issues=$(jq -r '
+            .runs[].results[] |
+            select(.message.text | test("critical severity"; "i")) |
+            {
+              ruleId,
+              severity: "CRITICAL",
+              message: .message.text,
+              file: .locations[0].physicalLocation.artifactLocation.uri,
+              line: .locations[0].physicalLocation.region.startLine
+            } |
+            "* **Severity:** \(.severity)\n  - **Rule:** \(.ruleId)\n  - **Message:** \(.message)\n  - **Location:** \(.file):\(.line)\n"
+          ' snyk-oss.sarif)
+
+        low_severity_issues=$(jq -r '
+            .runs[].results[] |
+            select(.message.text | test("low severity"; "i")) |
+            {
+              ruleId,
+              severity: "LOW",
+              message: .message.text,
+              file: .locations[0].physicalLocation.artifactLocation.uri,
+              line: .locations[0].physicalLocation.region.startLine
+            } |
+            "* **Severity:** \(.severity)\n  - **Rule:** \(.ruleId)\n  - **Message:** \(.message)\n  - **Location:** \(.file):\(.line)\n"
+          ' snyk-oss.sarif)
+
+        medium_severity_issues=$(jq -r '
+            .runs[].results[] |
+            select(.message.text | test("medium severity"; "i")) |
+            {
+              ruleId,
+              severity: "MEDIUM",
+              message: .message.text,
+              file: .locations[0].physicalLocation.artifactLocation.uri,
+              line: .locations[0].physicalLocation.region.startLine
+            } |
+            "* **Severity:** \(.severity)\n  - **Rule:** \(.ruleId)\n  - **Message:** \(.message)\n  - **Location:** \(.file):\(.line)\n"
+          ' snyk-oss.sarif)
+
+        high_severity_issues=$(jq -r '
+            .runs[].results[] |
+            select(.message.text | test("high severity"; "i")) |
+            {
+              ruleId,
+              severity: "HIGH",
+              message: .message.text,
+              file: .locations[0].physicalLocation.artifactLocation.uri,
+              line: .locations[0].physicalLocation.region.startLine
+            } |
+            "* **Severity:** \(.severity)\n  - **Rule:** \(.ruleId)\n  - **Message:** \(.message)\n  - **Location:** \(.file):\(.line)\n"
+          ' snyk-oss.sarif)
+
+        # Append issues based on severity
+        if [ -n "$critical_severity_issues" ]; then
+          comment_body+="\n### 🔴 Critical Severity Issues\n$critical_severity_issues\n"
+        fi
+        if [ -n "$low_severity_issues" ]; then
+          comment_body+="\n### 🔵 Low Severity Issues\n$low_severity_issues\n"
+        fi
+        if [ -n "$medium_severity_issues" ]; then
+          comment_body+="\n### 🟡 Medium Severity Issues\n$medium_severity_issues\n"
+        fi
+        if [ -n "$high_severity_issues" ]; then
+          comment_body+="\n### 🟠 High Severity Issues\n$high_severity_issues\n"
+        fi
+
+        echo "Posting comment to: $COMMENT_URL"
+
+        response=$(curl -s -w "%{http_code}" -o /tmp/response.txt -u :$(System.AccessToken) \
+          -X POST \
+          -H "Content-Type: application/json" \
+          -d '{"comments": [{"parentCommentId": 0, "content": "'"$comment_body"'"}]}' \
+          "$COMMENT_URL")
+
+        echo "API response code: $response"
+        cat /tmp/response.txt
+      displayName: 'Post Formatted Snyk Vulnerabilities to PR'
+      continueOnError: true
+
+#- script: | 
+#    snyk test --all-projects --json | snyk-to-html -o results.html
+#  displayName: 'Snyk open source scan to html'
+  # snyk open source
+#- script: |
+#    snyk test --all-projects --json-file-output=results.json || true
+#    RESULT=$?
+#    snyk-to-html -o $(Build.ArtifactStagingDirectory)/results-open-source.html < results.json
+#    exit $RESULT
+#  displayName: 'snyk open source'
+
+#- script: |
+#    snyk monitor --all-projects --org=dev-team || true
+#  displayName: 'snyk monitor open source'
+  
+#- script: | 
+#    docker build . -t juice-shop
+#  displayName: 'build image'
+
+#- script: | 
+#    snyk container test juice-shop --file=Dockerfile || true
+#  displayName: 'Snyk container scan'
+#- task: PublishHtmlReport@1
+#  condition: succeededOrFailed()
+#  inputs:
+#    reportDir: $(Build.ArtifactStagingDirectory)/results-open-source.html
+#    tabName: 'Snyk Open Source' 
+
