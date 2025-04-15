@@ -1,0 +1,91 @@
+name: Notify PR Author on Check Failure
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  check-status:
+    runs-on: ubuntu-latest
+    steps:
+      # Step 1: Checkout the code
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      # Step 2: Fetch the commit SHA associated with the PR
+      - name: Fetch commit SHA for PR
+        id: fetch-sha
+        run: |
+          COMMIT_SHA=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" | jq -r '.head.sha')
+          
+          echo "COMMIT_SHA=$COMMIT_SHA" >> $GITHUB_ENV
+          echo "Fetched commit SHA: $COMMIT_SHA"
+
+      # Step 3: Fetch the status checks for the commit
+      - name: Fetch status checks for PR commit
+        id: fetch-checks
+        run: |
+          echo "Fetching status checks for commit $COMMIT_SHA"
+          
+          # Fetch the status checks for the commit associated with the PR
+          PR_CHECKS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/commits/$COMMIT_SHA/status")
+
+          # Debugging: Print the raw API response
+          echo "PR_CHECKS: $PR_CHECKS"
+
+          # Retry logic: Check for pending statuses and wait for a bit
+          CHECK_STATUS=$(echo "$PR_CHECKS" | jq -r '.state')
+          if [[ "$CHECK_STATUS" == "pending" ]]; then
+            echo "Status check is still pending. Retrying in 30 seconds..."
+            sleep 30
+            PR_CHECKS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/commits/$COMMIT_SHA/status")
+            CHECK_STATUS=$(echo "$PR_CHECKS" | jq -r '.state')
+          fi
+
+          # If the check is still pending after retrying, exit early
+          if [[ "$CHECK_STATUS" == "pending" ]]; then
+            echo "Status check is still pending after retry. Exiting."
+            echo "FAILURE_FOUND=0" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          # Check if the response contains no status checks
+          if [[ "$PR_CHECKS" == "null" || "$PR_CHECKS" == "[]" ]]; then
+            echo "No status checks found for this PR."
+            echo "FAILURE_FOUND=0" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          # Extract the conclusion of each status check (success, failure, etc.)
+          CONCLUSIONS=$(echo "$PR_CHECKS" | jq -r '.statuses[].state' 2>/dev/null)
+
+          # Check if jq failed (e.g., no status checks found)
+          if [[ $? -ne 0 || -z "$CONCLUSIONS" ]]; then
+            echo "No status checks or conclusions found."
+            echo "FAILURE_FOUND=0" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          # Check if any status check is a failure
+          FAILURE_FOUND=$(echo "$CONCLUSIONS" | grep -c "failure")
+          echo "Failures found: $FAILURE_FOUND"
+          echo "FAILURE_FOUND=$FAILURE_FOUND" >> $GITHUB_ENV
+
+      # Step 4: Notify PR author if failure found
+      - name: Notify PR author if failure is found
+        if: env.FAILURE_FOUND != '0'
+        run: |
+          # Get the PR author's username
+          PR_AUTHOR=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" | jq -r '.user.login')
+
+          echo "Notifying PR author: $PR_AUTHOR"
+
+          # Post a comment on the PR to notify the PR author
+          curl -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --data '{"body": "Hi @'"$PR_AUTHOR"', your PR #'"${{ github.event.pull_request.number }}"' has a failing status check."}' \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments"
